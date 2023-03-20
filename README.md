@@ -26,3 +26,13 @@
   - including posts created
   - comments created
   - likes given and received
+
+## Setup
+
+You need mongodb, rabbitmq, and redis running.
+
+```bash 
+docker run -d -p 27017:27017 -e MONGO_INITDB_DATABASE=buzzwords mongo
+docker run -d -p 5672:5672 rabbitmq
+docker run -d -p 6379:6379 redis
+```

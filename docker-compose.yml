@@ -1,11 +1,17 @@
 version: "3.8"
 services:
   nginx:
-    image: nginx
+    image: nginx:latest
+    volumes:
+      - ./templates:/etc/nginx/templates
     ports:
       - "80:80"
+    environment:
+      BUZZWORDS_URL: http://app:3000
   mongo:
     image: mongo
+    environment:
+        - MONGO_INITDB_DATABASE=buzzwords
   redis:
     image: redis
   rabbitmq:
@@ -14,7 +20,7 @@ services:
     build:
       context: .
     environment:
-      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_URL=mongodb://mongo:27017/buzzwords
       - REDIS_URL=redis://redis:6379
       - RABBITMQ_URL=amqp://rabbitmq:5672
       - PORT=3000
