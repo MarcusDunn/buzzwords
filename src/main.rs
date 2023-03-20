@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let router = axum::Router::new()
+        .route("/healthcheck", get(|| async { "OK" }))
         .route("/user/new", post(post_new_user))
         .route("/user/:username", get(get_user))
         .route("/user/:username/notifications", get(get_user_notification))

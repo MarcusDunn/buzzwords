@@ -4,19 +4,45 @@ services:
     image: nginx:latest
     volumes:
       - ./templates:/etc/nginx/templates
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
     ports:
       - "80:80"
     environment:
       BUZZWORDS_URL: http://app:3000
   mongo:
     image: mongo
+    healthcheck:
+      test: [ "CMD", "mongo", "--eval", "db.runCommand('ping').ok" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
     environment:
         - MONGO_INITDB_DATABASE=buzzwords
   redis:
     image: redis
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
   rabbitmq:
     image: rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmqctl", "status" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
   app:
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:3000/healthcheck" ]
     build:
       context: .
     environment:
