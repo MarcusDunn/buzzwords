@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use axum::extract::{Path, State};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderName, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Json;
@@ -15,6 +15,10 @@ use mongodb::{Database, IndexModel};
 use mongodb::results::CreateIndexResult;
 use redis::{AsyncCommands, FromRedisValue, RedisResult, Value};
 use time::{Date, OffsetDateTime};
+use tower::ServiceBuilder;
+use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::ServiceBuilderExt;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{debug, info, trace, Span, error, warn};
 
 #[derive(Debug, Deserialize, Clone)]
@@ -139,14 +143,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/post/:post_id/comment", get(get_post_comment))
         .route("/post/:post_id/comment/new", post(post_new_comment))
         .route("/post/:post_id/comment/:comment_id/like", post(post_comment_like))
-        .layer(tower_http::trace::TraceLayer::new_for_http()
-            .on_request(|_: &Request<_>, _: &Span| {
-                debug!("received request")
-            })
-            .on_response(|resp: &Response<_>, duration: Duration, _: &Span| {
-                debug!(status=?resp.status(), micros=duration.as_micros(), "finished processing request")
-            })
-        ).with_state(application);
+        .layer(tower::ServiceBuilder::new().propagate_x_request_id())
+        .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::new().include_headers(true)))
+        .layer(tower::ServiceBuilder::new().set_x_request_id(tower_http::request_id::MakeRequestUuid { }))
+        .with_state(application);
 
     let server = axum::Server::bind(&server_addr)
         .serve(router.into_make_service())
