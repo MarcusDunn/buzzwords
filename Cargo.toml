@@ -6,3 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+redis = { version = "0.22.3", features = ["tokio-comp"] }
+tokio = { version = "1.26.0", features = ["full"] }
+amiquip = { version = "0.4.2", default-features = false }
+axum = { version = "0.6.11", features = ["json", "macros", "tower-log"] }
+tracing = { version = "0.1.37" }
+tracing-subscriber = { version = "0.3.16", features = ["fmt", "env-filter"] }
+serde = { version = "1.0.157", features = ["derive"] }
+dotenvy = "0.15.6"
+anyhow = "1.0.70"
+tower-http = { version = "0.4.0", features = ["full"] }
+

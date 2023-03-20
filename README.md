@@ -1,0 +1,28 @@
+## Features
+
+- [ ] Ability to store information about users. including:
+  - name
+  - username
+  - email
+  - password
+  - date of birth
+  - list of friends
+- [ ] Ability to store information about posts, including:
+  - title
+  - content 
+  - author
+  - date of creation
+  - number of likes and comments.
+- [ ] Ability to store information about comments, including
+  - content
+  - author
+  - date of creation
+  - number of likes
+- [ ] Ability to track notifications for users, including
+  - notifications for new posts
+  - comments
+  - and likes
+- [ ] Ability to generate reports on user activity,
+  - including posts created
+  - comments created
+  - likes given and received

@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  nginx:
+    image: nginx
+    ports:
+      - "80:80"
+  mongo:
+    image: mongo
+  redis:
+    image: redis
+  rabbitmq:
+    image: rabbitmq
+  app:
+    build:
+      context: .
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - PORT=3000
