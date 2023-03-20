@@ -10,8 +10,9 @@ use std::num::ParseIntError;
 use std::time::Duration;
 use anyhow::anyhow;
 use mongodb::{Database, IndexModel};
+use mongodb::results::CreateIndexResult;
 use time::{Date, OffsetDateTime};
-use tracing::{debug, info, trace, Span, error};
+use tracing::{debug, info, trace, Span, error, warn};
 
 #[derive(Debug, Deserialize, Clone)]
 struct NewUser {
@@ -83,7 +84,9 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     trace!("Loading .env file");
-    dotenvy::dotenv()?;
+    if let Err(err) = dotenvy::dotenv() {
+        warn!("error loading .env file: {}", err)
+    }
 
     let server_addr = std::net::SocketAddr::new(get_ip()?, get_port()?);
 
@@ -119,7 +122,12 @@ async fn main() -> anyhow::Result<()> {
             })
         ).with_state(application);
 
-    let server = axum::Server::bind(&server_addr).serve(router.into_make_service());
+    let server = axum::Server::bind(&server_addr)
+        .serve(router.into_make_service())
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.expect("failed to listen for CTRL+C");
+            info!("Shutting down");
+        });
 
     info!("Server started on {}", server_addr);
 
@@ -133,12 +141,7 @@ async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
         .default_database()
         .ok_or_else(|| anyhow!("no default database"))?;
 
-    async fn index_users(database: &Database) -> anyhow::Result<()> {
-        trace!("creating user collection");
-        database
-            .create_collection("user", None)
-            .await?;
-
+    async fn index_users(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
         trace!("creating user index on username");
         database
             .collection::<User>("user")
@@ -151,9 +154,7 @@ async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
                     )
                     .build(),
                 None,
-            ).await?;
-
-        Ok(())
+            ).await
     }
 
     tokio::try_join!(index_users(&database))?;

@@ -13,11 +13,14 @@ services:
     ports:
       - "80:80"
     environment:
-      BUZZWORDS_URL: http://app:3000
+      BUZZWORDS_URL: http://buzzwords:3000
+    depends_on:
+      buzzwords:
+        condition: service_healthy
   mongo:
     image: mongo
     healthcheck:
-      test: [ "CMD", "mongo", "--eval", "db.runCommand('ping').ok" ]
+      test: [ "CMD", "mongosh", "--eval", "db.runCommand('ping').ok" ]
       interval: 1s
       timeout: 1s
       retries: 5
@@ -40,12 +43,25 @@ services:
       timeout: 1s
       retries: 5
       start_period: 1s
-  app:
+  buzzwords:
+    init: true
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:3000/healthcheck" ]
+      interval: 1s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
     build:
       context: .
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
+      - RUST_LOG=buzzwords=trace,tower_http=trace
       - MONGO_URL=mongodb://mongo:27017/buzzwords
       - REDIS_URL=redis://redis:6379
       - RABBITMQ_URL=amqp://rabbitmq:5672
