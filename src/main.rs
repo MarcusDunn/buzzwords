@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Formatter};
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
@@ -9,8 +10,10 @@ use std::net::{AddrParseError, IpAddr};
 use std::num::ParseIntError;
 use std::time::Duration;
 use anyhow::anyhow;
+use deadpool_redis::Runtime;
 use mongodb::{Database, IndexModel};
 use mongodb::results::CreateIndexResult;
+use redis::{AsyncCommands, FromRedisValue, RedisResult, Value};
 use time::{Date, OffsetDateTime};
 use tracing::{debug, info, trace, Span, error, warn};
 
@@ -29,6 +32,20 @@ struct User {
     email: String,
     date_of_creation: Date,
     friends: Vec<String>,
+}
+
+impl FromRedisValue for User {
+    fn from_redis_value(v: &Value) -> RedisResult<Self> {
+        if let Value::Data(ref bytes) = v {
+            Ok(serde_json::from_slice(bytes.as_slice()).map_err(|err| {
+                error!("failed to parse redis bytes into a User: {err}");
+                (redis::ErrorKind::TypeError, "failed to parse redis bytes into a User", format!("{err}"))
+            })?)
+        } else {
+            error!("incorrect type when turning a redis value into a User: {v:?}");
+            Err((redis::ErrorKind::TypeError, "incorrect type to turn into User").into())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -72,11 +89,21 @@ enum Notification {
     CommentLike { id: u32, username: String },
 }
 
-#[derive(Debug, axum::extract::FromRef, Clone)]
+#[derive(axum::extract::FromRef, Clone)]
 struct Application {
-    redis: redis::Client,
-    rabbit: lapin::Channel,
+    redis: deadpool_redis::Pool,
+    rabbit: deadpool_lapin::Pool,
     mongo: mongodb::Client,
+}
+
+impl Debug for Application {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Application")
+            .field("redis", &"deadpool_redis::Pool")
+            .field("rabbit", &self.rabbit)
+            .field("mongo", &self.mongo)
+            .finish()
+    }
 }
 
 #[tokio::main]
@@ -93,7 +120,6 @@ async fn main() -> anyhow::Result<()> {
     let redis = get_redis()?;
     let mongo = get_mongodb().await?;
     index_mongo(&mongo).await?;
-
 
     let rabbit = get_rabbitmq().await?;
 
@@ -162,7 +188,7 @@ async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[axum::debug_handler]
+#[axum::debug_handler(state = Application)]
 #[tracing::instrument(skip(mongo))]
 async fn post_new_user(
     State(mongo): State<mongodb::Client>,
@@ -185,32 +211,54 @@ async fn post_new_user(
     db.collection("users")
         .insert_one(
             mongodb::bson::to_document(&user).map_err(|err| {
-                error!("failed to insert user: {}", err);
+                error!("failed to insert user: {err}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to insert user: {}", err),
+                    format!("failed to insert user: {err}"),
                 )
             })?,
             None,
         )
         .await
         .map_err(|err| {
-            error!("failed to insert user: {}", err);
+            error!("failed to insert user: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to insert user: {}", err),
+                format!("failed to insert user: {err}"),
             )
         })?;
     trace!("Inserted user: {:?}", user);
     Ok(Json(user))
 }
 
-#[axum::debug_handler]
-#[tracing::instrument(skip(mongo))]
+#[axum::debug_handler(state = Application)]
+#[tracing::instrument(skip(mongo, redis))]
 async fn get_user(
     State(mongo): State<mongodb::Client>,
+    State(redis): State<deadpool_redis::Pool>,
     Path(username): Path<String>,
 ) -> Result<Json<User>, (StatusCode, String)> {
+    let mut redis_conn = redis.get().await.map_err(|err| {
+        error!("failed to obtain redis connection: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to obtain redis connection: {err}"),
+        )
+    })?;
+
+    if let Some(user) = redis_conn.get(&username).await.map_err(|err| {
+        error!("failed to fetch user from redis: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to fetch user from redis: {err}"),
+        )
+    })? {
+        trace!("got user from redis cache: {user:?}");
+        return Ok(Json(user));
+    } else {
+        trace!("user not found in redis cache");
+    }
+
     let db = mongo.default_database().ok_or_else(|| {
         error!("No default database specified");
         (
@@ -218,7 +266,8 @@ async fn get_user(
             String::from("No default database specified"),
         )
     })?;
-    let user = db
+
+    let user: User = db
         .collection("users")
         .find_one(
             mongodb::bson::doc! { "username": &username },
@@ -226,20 +275,39 @@ async fn get_user(
         )
         .await
         .map_err(|err| {
-            error!("failed to find user: {}", err);
+            error!("failed to find user: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to find user: {}", err),
+                format!("failed to find user: {err}"),
             )
         })?
         .ok_or_else(|| {
-            error!("user {} not found", username);
+            error!("user {username} not found");
             (
                 StatusCode::BAD_REQUEST,
-                format!("user {} not found", username),
+                format!("user {username} not found"),
             )
         })?;
-    trace!("found user: {:?}", user);
+    trace!("found user: {:?}", &user);
+
+    let user_json = serde_json::to_string(&user).map_err(|err| {
+        error!("failed to serialize user: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize user: {err}"),
+        )
+    })?;
+
+    redis_conn.set(username, user_json).await.map_err(|err| {
+        error!("failed to insert user into redis cache: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to insert user into redis cache: {err}"),
+        )
+    })?;
+
+    trace!("inserted user into redis cache");
+
     Ok(Json(user))
 }
 
@@ -330,10 +398,10 @@ fn get_port() -> Result<u16, ParseIntError> {
     Ok(port)
 }
 
-fn get_redis() -> anyhow::Result<redis::Client> {
+fn get_redis() -> anyhow::Result<deadpool_redis::Pool> {
     trace!("Reading REDIS_URL");
     let redis_url = std::env::var("REDIS_URL")?;
-    let client = redis::Client::open(redis_url)?;
+    let client = deadpool_redis::Config::from_url(redis_url).create_pool(Some(Runtime::Tokio1))?;
     trace!("Redis client created");
     Ok(client)
 }
@@ -348,12 +416,12 @@ async fn get_mongodb() -> anyhow::Result<mongodb::Client> {
     Ok(client)
 }
 
-async fn get_rabbitmq() -> anyhow::Result<lapin::Channel> {
+async fn get_rabbitmq() -> anyhow::Result<deadpool_lapin::Pool> {
+    use deadpool_lapin::Config;
     trace!("Reading RABBITMQ_URL");
     let rabbitmq_url = std::env::var("RABBITMQ_URL")?;
-    let conn =
-        lapin::Connection::connect(&rabbitmq_url, lapin::ConnectionProperties::default()).await?;
-    let channel = conn.create_channel().await?;
+    let config = Config { url: Some(rabbitmq_url), ..Config::default() };
+    let pool = config.create_pool(Some(Runtime::Tokio1))?;
     trace!("RabbitMQ channel created");
-    Ok(channel)
+    Ok(pool)
 }
