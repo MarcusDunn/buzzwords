@@ -102,11 +102,23 @@ struct Comment {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Notification {
     NewPost(Post),
+    NewPostLike(NewPostLike)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NewPostLike {
+    title: String,
+    liker: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Follow {
     follower: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Like {
+    liker: String,
 }
 
 #[derive(axum::extract::FromRef, Clone)]
@@ -772,13 +784,65 @@ async fn get_user_notification(
     Ok(Json(vec))
 }
 
-#[axum::debug_handler]
-#[tracing::instrument]
-async fn post_post_like(Path(post_id): Path<u32>) -> Result<(), (StatusCode, String)> {
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        String::from("POST /post/:post_id/like is not implemented"),
-    ))
+#[axum::debug_handler(state = Application)]
+#[tracing::instrument(skip(db, rabbitmq))]
+async fn post_post_like(
+    Mongo(db): Mongo,
+    RabbitMQ(rabbitmq): RabbitMQ,
+    Path((username, title)): Path<(String, String)>,
+    Json(Like{ liker }): Json<Like>,
+) -> Result<(), (StatusCode, String)> {
+    db.collection::<Post>("post").find_one_and_update(
+        doc! {
+            "author": &username,
+            "title": &title,
+        },
+        doc! {
+            "$inc": {
+                "number_of_likes": 1,
+            }
+        },
+        None,
+    ).await.map_err(|err| {
+        error!("failed to like post: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to like post: {err}"),
+        )
+    })?;
+
+    let notification_json_bytes = serde_json::to_vec(&Notification::NewPostLike(NewPostLike {
+        liker,
+        title,
+    })).map_err(|err| {
+        error!("failed to serialize notification: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize notification: {err}"),
+        )
+    })?;
+
+    rabbitmq.create_channel().await.map_err(|err| {
+        error!("failed to create rabbitmq channel: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create rabbitmq channel: {err}"),
+        )
+    })?.basic_publish(
+        "",
+        &username,
+        BasicPublishOptions::default(),
+        &notification_json_bytes,
+        BasicProperties::default(),
+    ).await.map_err(|err| {
+        error!("failed to publish notification: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to publish notification: {err}"),
+        )
+    })?;
+
+    Ok(())
 }
 
 #[axum::debug_handler]
