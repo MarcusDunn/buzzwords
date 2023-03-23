@@ -1,7 +1,5 @@
 use axum::extract::{FromRef, FromRequestParts, Path};
 use axum::http::StatusCode;
-use futures::stream::StreamExt;
-use futures::stream::TryStreamExt;
 use std::fmt::Debug;
 
 use anyhow::anyhow;
@@ -9,7 +7,9 @@ use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::Json;
 use deadpool_redis::{Connection, Runtime};
-use lapin::options::{BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions};
+use lapin::options::{
+    BasicAckOptions, BasicGetOptions, BasicPublishOptions, QueueDeclareOptions,
+};
 use lapin::types::FieldTable;
 use lapin::BasicProperties;
 use mongodb::bson::doc;
@@ -20,12 +20,12 @@ use redis::{AsyncCommands, FromRedisValue, RedisResult, Value};
 use serde::{Deserialize, Serialize};
 use std::net::{AddrParseError, IpAddr};
 use std::num::ParseIntError;
-use axum::body::HttpBody;
+use std::time::Duration;
 use time::{Date, OffsetDateTime};
-use tower_http::request_id::SetRequestIdLayer;
+use tower_http::timeout::Timeout;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tower_http::{LatencyUnit, ServiceBuilderExt};
-use tracing::{debug, error, info, trace, warn, Span, Level};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
@@ -41,6 +41,7 @@ struct NewUser {
 struct User {
     name: String,
     username: String,
+    password: String,
     email: String,
     date_of_creation: Date,
     followers: Vec<String>,
@@ -100,7 +101,7 @@ struct Comment {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum Notification {
-    NewPost(Post)
+    NewPost(Post),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -139,7 +140,7 @@ where
     }
 }
 
-struct Redis(deadpool_redis::Connection);
+struct Redis(Connection);
 
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for Redis
@@ -150,7 +151,7 @@ where
     type Rejection = (StatusCode, String);
 
     #[tracing::instrument(name = "get redis connection", skip_all)]
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let redis = deadpool_redis::Pool::from_ref(state);
         trace!("redis pool status: {:?}", redis.status());
         let redis_conn = redis.get().await.map_err(|err| {
@@ -175,7 +176,7 @@ where
     type Rejection = (StatusCode, String);
 
     #[tracing::instrument(name = "get rabbitmq connection", skip_all)]
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let rabbit = deadpool_lapin::Pool::from_ref(state);
         trace!("rabbit pool status: {:?}", rabbit.status());
         let rabbit_conn = rabbit.get().await.map_err(|err| {
@@ -249,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             tower::ServiceBuilder::new()
                 .set_x_request_id(tower_http::request_id::MakeRequestUuid {}),
         )
+        .layer(Timeout::<()>::layer(Duration::from_secs(2)))
         .with_state(application);
 
     let server = axum::Server::bind(&server_addr)
@@ -272,9 +274,7 @@ async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
         .default_database()
         .ok_or_else(|| anyhow!("no default database"))?;
 
-    async fn index_users(
-        database: &Database,
-    ) -> mongodb::error::Result<CreateIndexResult> {
+    async fn index_users(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
         trace!("creating user index on username");
         database
             .collection::<User>("user")
@@ -288,9 +288,7 @@ async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
             .await
     }
 
-    async fn index_posts(
-        database: &Database,
-    ) -> mongodb::error::Result<CreateIndexResult> {
+    async fn index_posts(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
         trace!("creating post index on title and username");
         database
             .collection::<Post>("post")
@@ -366,6 +364,7 @@ async fn post_new_user(
         name: new_user.name,
         username: new_user.username,
         email: new_user.email,
+        password: new_user.password,
         date_of_creation: OffsetDateTime::now_utc().date(),
         followers: Vec::new(),
     };
@@ -399,20 +398,24 @@ async fn get_user(
     Redis(mut redis): Redis,
     Path(username): Path<String>,
 ) -> Result<Json<User>, (StatusCode, String)> {
-    if let Some(user) = redis_fetch_user_by_name(&mut redis, &username).await.map_err(|err| {
-        error!("failed to fetch user from redis: {err}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to fetch user from redis: {err}"),
-        )
-    })? {
+    if let Some(user) = redis_fetch_user_by_name(&mut redis, &username)
+        .await
+        .map_err(|err| {
+            error!("failed to fetch user from redis: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to fetch user from redis: {err}"),
+            )
+        })?
+    {
         trace!("got user from redis cache: {user:?}");
         return Ok(Json(user));
     } else {
         trace!("user not found in redis cache");
     }
 
-    let user: User = mongo_get_user_by_username(db, &username).await
+    let user: User = mongo_get_user_by_username(db, &username)
+        .await
         .map_err(|err| {
             error!("failed to find user: {err}");
             (
@@ -451,15 +454,20 @@ async fn get_user(
 }
 
 #[tracing::instrument(skip_all)]
-async fn mongo_get_user_by_username(db: Database, username: &String) -> mongodb::error::Result<Option<User>> {
-    db
-        .collection("user")
+async fn mongo_get_user_by_username(
+    db: Database,
+    username: &String,
+) -> mongodb::error::Result<Option<User>> {
+    db.collection("user")
         .find_one(doc! { "username": &username }, None)
         .await
 }
 
 #[tracing::instrument(skip_all)]
-async fn redis_fetch_user_by_name(redis: &mut Connection, username: &String) -> RedisResult<Option<User>> {
+async fn redis_fetch_user_by_name(
+    redis: &mut Connection,
+    username: &String,
+) -> RedisResult<Option<User>> {
     redis.get(&username).await
 }
 
@@ -512,7 +520,10 @@ async fn post_new_post(
     })?;
 
     redis
-        .set(format!("{username}/{}", &post.title), post_json_bytes.clone())
+        .set(
+            format!("{username}/{}", &post.title),
+            post_json_bytes.clone(),
+        )
         .await
         .map_err(|err| {
             error!("failed to insert post into redis cache: {err}");
@@ -522,18 +533,23 @@ async fn post_new_post(
             )
         })?;
 
-    // todo: FIX
-    let mut users = db
+    let Some(user) = db
         .collection::<User>("user")
-        .find(doc! { "followers": { "$elemMatch": { "$eq": &username } } }, None)
+        .find_one(doc! { "username": &username }, None)
         .await
         .map_err(|err| {
-            error!("failed to find friends of {username}: {err}");
+            error!("failed to find {username}: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to find friends of {username}: {err}"),
+                format!("failed to find {username}: {err}"),
             )
-        })?;
+        })? else {
+        error!("user {username} not found");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("user {username} not found"),
+        ));
+    };
 
     let channel = rabbitmq.create_channel().await.map_err(|err| {
         error!("failed to create rabbitmq channel: {err}");
@@ -542,21 +558,6 @@ async fn post_new_post(
             format!("failed to create rabbitmq channel: {err}"),
         )
     })?;
-
-    let queue = channel
-        .queue_declare(
-            &username,
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .map_err(|err| {
-            error!("failed to declare queue: {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to declare queue: {err}"),
-            )
-        })?;
 
     let post_notification = Notification::NewPost(post.clone());
     let post_notification_json_bytes = serde_json::to_vec(&post_notification).map_err(|err| {
@@ -567,21 +568,28 @@ async fn post_new_post(
         )
     })?;
 
-    while let Some(doc) = users.next().await {
-        let user = doc.map_err(|err| {
-            error!("failed to get next user {err}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to get next user {err}"),
-            )
-        })?;
+    for follower in user.followers {
+        trace!("notifying follower: {:?}", &follower);
 
-        trace!("notifying friend: {:?}", &user);
+        channel
+            .queue_declare(
+                &follower,
+                QueueDeclareOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                error!("failed to declare queue: {err}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to declare queue: {err}"),
+                )
+            })?;
 
         channel
             .basic_publish(
                 "",
-                &user.username,
+                &follower,
                 BasicPublishOptions::default(),
                 post_notification_json_bytes.as_slice(),
                 BasicProperties::default(),
@@ -725,27 +733,25 @@ async fn get_user_notification(
         )
     })?;
 
-    let mut consumer = channel.basic_consume(
-        &username,
-        "",
-        BasicConsumeOptions::default(),
-        FieldTable::default(),
-    ).await.map_err(|err| {
-        error!("failed to consume notifications: {err}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to consume notifications: {err}"),
-        )
-    })?;
+    trace!("created rabbitmq channel");
 
     let mut vec = vec![];
 
-    while let Some(next) = consumer.next().await {
+    while let Some(next) = channel.basic_get(&username, BasicGetOptions::default()).await.transpose()
+    {
         let next = next.map_err(|err| {
             error!("failed to get next notification: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to get next notification: {err}"),
+            )
+        })?;
+
+        next.ack(BasicAckOptions::default()).await.map_err(|err| {
+            error!("failed to ack notification: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to ack notification: {err}"),
             )
         })?;
 
@@ -757,8 +763,11 @@ async fn get_user_notification(
             )
         })?;
 
+        trace!("received notification: {:?}", parsed);
         vec.push(parsed);
     }
+
+    trace!("finished consuming notifications");
 
     Ok(Json(vec))
 }
