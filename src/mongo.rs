@@ -8,6 +8,7 @@ use mongodb::results::CreateIndexResult;
 use tracing::trace;
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, IndexOptions};
+use crate::comment::Comment;
 use crate::post::Post;
 use crate::user::User;
 
@@ -40,34 +41,6 @@ pub async fn index_mongo(mongo: &mongodb::Client) -> anyhow::Result<()> {
         .default_database()
         .ok_or_else(|| anyhow!("no default database"))?;
 
-    async fn index_users(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
-        trace!("creating user index on username");
-        database
-            .collection::<User>("user")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "name": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-                None,
-            )
-            .await
-    }
-
-    async fn index_posts(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
-        trace!("creating post index on title and username");
-        database
-            .collection::<Post>("post")
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "title": 1, "username": 1 })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-                None,
-            )
-            .await
-    }
-
     tokio::try_join!(index_users(&database), index_posts(&database))?;
 
     Ok(())
@@ -82,4 +55,46 @@ pub async fn get_mongodb() -> anyhow::Result<mongodb::Client> {
     let client = mongodb::Client::with_options(options)?;
     trace!("Mongo client created");
     Ok(client)
+}
+
+async fn index_posts(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
+    trace!("creating post index on title and username");
+    database
+        .collection::<Post>("post")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "title": 1, "username": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await
+}
+
+async fn index_users(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
+    trace!("creating user index on username");
+    database
+        .collection::<User>("user")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "name": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await
+}
+
+async fn index_comments(database: &Database) -> mongodb::error::Result<CreateIndexResult> {
+    trace!("creating comment index on post_author, post_title, and title");
+    database
+        .collection::<Comment>("comment")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "post_author": 1, "post_title": 1, "title": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await
 }

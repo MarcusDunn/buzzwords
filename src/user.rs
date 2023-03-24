@@ -8,6 +8,7 @@ use mongodb::Database;
 use mongodb::bson::doc;
 use deadpool_redis::Connection;
 use axum::extract::Path;
+use mongodb::bson::oid::ObjectId;
 use crate::mongo::Mongo;
 use crate::redis::Redis;
 
@@ -26,7 +27,16 @@ pub struct User {
     pub password: String,
     pub email: String,
     pub date_of_creation: Date,
+    // username
     pub followers: Vec<String>,
+    // username
+    pub following: Vec<String>,
+    // post_title
+    pub posts: Vec<String>,
+    // (author, post_title)
+    pub likes_posts: Vec<(String, String)>,
+    // (author, post_title, comment_id)
+    pub likes_comments: Vec<(String, String, ObjectId)>,
 }
 
 impl FromRedisValue for User {
@@ -63,8 +73,13 @@ pub async fn post_new_user(
         email: new_user.email,
         password: new_user.password,
         date_of_creation: OffsetDateTime::now_utc().date(),
+        posts: Vec::new(),
         followers: Vec::new(),
+        following: Vec::new(),
+        likes_posts: Vec::new(),
+        likes_comments: Vec::new(),
     };
+
     db.collection("user")
         .insert_one(
             mongodb::bson::to_document(&user).map_err(|err| {

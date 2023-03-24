@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             post(post_new_comment),
         )
         .route(
-            "/comment/:comment_id/like",
+            "/user/:username/post/:post_title/comment/:comment_title/like",
             post(post_comment_like),
         )
         .layer(tower::ServiceBuilder::new().propagate_x_request_id())

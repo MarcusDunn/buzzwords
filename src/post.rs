@@ -8,10 +8,11 @@ use mongodb::bson::doc;
 use lapin::options::{BasicPublishOptions, QueueDeclareOptions};
 use lapin::types::FieldTable;
 use lapin::BasicProperties;
+use mongodb::options::FindOneAndUpdateOptions;
+use mongodb::options::ReturnDocument::After;
 use redis::{AsyncCommands, FromRedisValue, RedisResult, Value};
 use redis::Value::Data;
 use crate::ampq::Ampq;
-use crate::comment::Comment;
 use crate::mongo::Mongo;
 use crate::notification::{NewPostLike, Notification};
 use crate::redis::Redis;
@@ -23,8 +24,10 @@ pub struct Post {
     pub content: String,
     pub author: String,
     pub date_of_creation: Date,
+    // usernames
     pub likes: Vec<String>,
-    pub comments: Vec<Comment>,
+    // comment titles
+    pub comments: Vec<String>,
 }
 
 impl FromRedisValue for Post {
@@ -85,6 +88,25 @@ pub async fn post_new_post(
 
     trace!("Inserted post: {:?}", post);
 
+    let Some(user) = db.collection::<User>("user")
+        .find_one_and_update(
+            doc! { "username": &username },
+            doc! { "$push": { "posts": &post.title } },
+            Some(FindOneAndUpdateOptions::builder().return_document(After).build()),
+        ).await.map_err(|err| {
+        error!("failed to update user");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to update user"),
+        )
+    })? else {
+        error!("user {username} not found");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("user {username} not found"),
+        ));
+    };
+
     let post_json_bytes = serde_json::to_vec(&post).map_err(|err| {
         error!("failed to serialize post: {err}");
         (
@@ -107,23 +129,23 @@ pub async fn post_new_post(
             )
         })?;
 
-    let Some(user) = db
-        .collection::<User>("user")
-        .find_one(doc! { "username": &username }, None)
+    let user_json_bytes = serde_json::to_vec(&user).map_err(|err| {
+        error!("failed to serialize user: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize user: {err}"),
+        )
+    })?;
+
+    redis.set(&user.username, user_json_bytes)
         .await
         .map_err(|err| {
-            error!("failed to find {username}: {err}");
+            error!("failed to insert user into redis cache: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to find {username}: {err}"),
+                format!("failed to insert user into redis cache: {err}"),
             )
-        })? else {
-        error!("user {username} not found");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("user {username} not found"),
-        ));
-    };
+        })?;
 
     let channel = rabbitmq.create_channel().await.map_err(|err| {
         error!("failed to create rabbitmq channel: {err}");
@@ -192,8 +214,30 @@ pub async fn post_post_like(
     Mongo(db): Mongo,
     Ampq(rabbitmq): Ampq,
     Path((username, title)): Path<(String, String)>,
-    Json(Like{ liker }): Json<Like>,
+    Json(Like { liker }): Json<Like>,
 ) -> Result<(), (StatusCode, String)> {
+    let Some(liker) = db.collection::<User>("user").find_one_and_update(doc! {
+        "username": &username,
+    }, doc! {
+        "$push": {
+            "likes_posts": [&username, &title],
+        }
+    }, Some(
+        FindOneAndUpdateOptions::builder().return_document(After).build()
+    )).await.map_err(|err| {
+        error!("failed to like post: {err}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to like post: {err}"),
+        )
+    })? else {
+        error!("user {liker} not found");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("user {liker} not found"),
+        ));
+    };
+
     db.collection::<Post>("post").find_one_and_update(
         doc! {
             "author": &username,
@@ -214,7 +258,7 @@ pub async fn post_post_like(
     })?;
 
     let notification_json_bytes = serde_json::to_vec(&Notification::NewPostLike(NewPostLike {
-        liker,
+        liker: liker.username,
         title,
     })).map_err(|err| {
         error!("failed to serialize notification: {err}");

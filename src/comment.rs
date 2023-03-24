@@ -23,12 +23,13 @@ pub struct NewComment {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Comment {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
+    pub post_author: String,
+    pub post_title: String,
+    pub title: String,
     pub content: String,
     pub author: String,
     pub date_of_creation: Date,
-    pub number_of_likes: u32,
+    pub likers: Vec<String>,
 }
 
 #[axum::debug_handler(state = crate::Application)]
@@ -196,17 +197,19 @@ pub async fn post_comment_like(
     Mongo(db): Mongo,
     Ampq(rabbitmq): Ampq,
     Redis(mut redis): Redis,
-    Path(comment_id): Path<ObjectId>,
+    Path((user_id, post_title, comment_title)): Path<(String, String, String)>,
     Json(Like { liker }): Json<Like>,
 ) -> Result<Json<Comment>, (StatusCode, String)> {
     let Some(comment) = db.collection::<Comment>("comment")
         .find_one_and_update(
             doc! {
-                "_id": &comment_id,
+                "post_title": &post_title,
+                "post_author": &user_id,
+                "title": &comment_title,
             },
             doc! {
-                "$inc": {
-                    "number_of_likes": 1,
+                "$addToSet": {
+                    "likers": &liker,
                 },
             },
             FindOneAndUpdateOptions::builder()
@@ -219,10 +222,10 @@ pub async fn post_comment_like(
                 format!("failed to like comment: {err}"),
             )
         })? else {
-            error!("comment {comment_id} not found");
+            error!("comment {user_id}/{post_title}/{comment_title} not found");
             return Err((
                 StatusCode::NOT_FOUND,
-                format!("comment {comment_id} not found"),
+                format!("comment {user_id}/{post_title}/{comment_title} not found"),
             ));
         };
 
