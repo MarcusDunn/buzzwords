@@ -26,7 +26,7 @@ pub async fn post_user_follow(
     Path(username): Path<String>,
     Json(Follow { follower }): Json<Follow>,
 ) -> Result<(), (StatusCode, String)> {
-    let Some(user) = db
+    let Some(followee) = db
         .collection::<User>("user")
         .find_one_and_update(
             doc! { "username": &username },
@@ -50,8 +50,32 @@ pub async fn post_user_follow(
         ));
     };
 
+    let Some(follower) = db
+        .collection::<User>("user")
+        .find_one_and_update(
+            doc! { "username": &follower },
+            doc! { "$push": { "following": &username } },
+            FindOneAndUpdateOptions::builder()
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await
+        .map_err(|err| {
+            error!("failed to follow: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to follow: {err}"),
+            )
+        })? else {
+        error!("user not found: {username}");
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("user not found: {username}"),
+        ));
+    };
+
     let new_follower_json_bytes = serde_json::to_vec(&Notification::NewFollower(NewFollower {
-        username: follower.clone(),
+        username: follower.username.clone(),
     })).map_err(|err| {
         error!("failed to serialize new follower: {err}");
         (
@@ -68,7 +92,7 @@ pub async fn post_user_follow(
         )
     })?.basic_publish(
         "",
-        &user.username,
+        &followee.username,
         lapin::options::BasicPublishOptions::default(),
         &new_follower_json_bytes,
         lapin::BasicProperties::default(),
@@ -80,7 +104,7 @@ pub async fn post_user_follow(
         )
     })?;
 
-    let user_json_bytes = serde_json::to_vec(&user).map_err(|err| {
+    let user_json_bytes = serde_json::to_vec(&followee).map_err(|err| {
         error!("failed to serialize user: {err}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -96,7 +120,7 @@ pub async fn post_user_follow(
         )
     })?;
 
-    trace!("{follower} followed user: {username}");
+    trace!("{} followed user: {username}", follower.username);
 
     Ok(())
 }

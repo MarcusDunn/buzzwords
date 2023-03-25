@@ -1,11 +1,10 @@
-use axum::body::HttpBody;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 use axum::extract::Path;
 use axum::Json;
 use axum::http::StatusCode;
+use futures::StreamExt;
 use mongodb::bson::doc;
-use mongodb::bson::oid::ObjectId;
 use tracing::{error, trace};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use redis::AsyncCommands;
@@ -17,6 +16,7 @@ use crate::redis::Redis;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NewComment {
+    pub title: String,
     pub content: String,
     pub author: String,
 }
@@ -39,43 +39,73 @@ pub async fn get_post_comment(
     Redis(mut redis): Redis,
     Path((username, post_title)): Path<(String, String)>,
 ) -> Result<Json<Vec<Comment>>, (StatusCode, String)> {
-    if let Some(post) = redis.get::<_, Option<Post>>(format!("{username}/{post_title}")).await.map_err(|err| {
+    let post = redis.get::<_, Option<Post>>(format!("{username}/{post_title}")).await.map_err(|err| {
         error!("failed to get post from redis: {err}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to get post from redis: {err}"),
         )
-    })? {
-        trace!("found post {username}/{post_title} in redis");
-        return Ok(Json(post.comments));
-    }
+    })?;
 
-    let post: Post = db
-        .collection("post")
-        .find_one(
-            doc! {
+    let comments = match post {
+        Some(post) => post.comments,
+        None => {
+            db
+                .collection::<Post>("post")
+                .find_one(
+                    doc! {
                 "author": &username,
                 "title": &post_title,
             },
+                    None,
+                )
+                .await
+                .map_err(|err| {
+                    error!("failed to find post: {err}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to find post: {err}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    error!("post {username}/{post_title} not found");
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("post {username}/{post_title} not found"),
+                    )
+                })?.comments
+        }
+    };
+
+    let mut comments = db.collection::<Comment>("comments")
+        .find(
+            doc! {
+                    "post_author": &username,
+                    "post_title": &post_title,
+                },
             None,
-        )
-        .await
+        ).await
         .map_err(|err| {
-            error!("failed to find post: {err}");
+            error!("failed to find comments: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to find post: {err}"),
-            )
-        })?
-        .ok_or_else(|| {
-            error!("post {username}/{post_title} not found");
-            (
-                StatusCode::NOT_FOUND,
-                format!("post {username}/{post_title} not found"),
+                format!("failed to find comments: {err}"),
             )
         })?;
 
-    Ok(Json(post.comments))
+    let mut collector = vec![];
+
+    while let Some(comment) = comments.next().await {
+        collector.push(comment.map_err(|err| {
+            error!("failed to get comment: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to get comment: {err}"),
+            )
+        })?);
+    }
+
+    Ok(Json(collector))
 }
 
 #[axum::debug_handler(state = crate::Application)]
@@ -88,11 +118,13 @@ pub async fn post_new_comment(
     Json(new_comment): Json<NewComment>,
 ) -> Result<Json<Comment>, (StatusCode, String)> {
     let comment = Comment {
-        id: None,
+        post_title: post_title.clone(),
+        title: new_comment.title,
+        post_author: username.clone(),
         content: new_comment.content,
         author: new_comment.author,
         date_of_creation: OffsetDateTime::now_utc().date(),
-        number_of_likes: 0,
+        likers: vec![],
     };
 
     let post = db
@@ -104,13 +136,7 @@ pub async fn post_new_comment(
             },
             doc! {
                 "$push": {
-                    "comments": mongodb::bson::to_document(&comment).map_err(|err| {
-                        error!("failed to insert comment: {err}");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("failed to insert comment: {err}"),
-                        )
-                    })?,
+                    "comments": &comment.title
                 },
             },
             FindOneAndUpdateOptions::builder()
@@ -119,10 +145,28 @@ pub async fn post_new_comment(
         )
         .await
         .map_err(|err| {
-            error!("failed to insert comment: {err}");
+            error!("failed to insert comment into post: {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to insert comment: {err}"),
+                format!("failed to insert comment into post: {err}"),
+            )
+        })?;
+
+    db
+        .collection("comment")
+        .insert_one(mongodb::bson::to_document(&comment).map_err(|err| {
+            error!("failed to serialize comment: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize comment: {err}"),
+            )
+        })?, None)
+        .await
+        .map_err(|err| {
+            error!("failed to insert comment into mongo: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to insert comment into mongo: {err}"),
             )
         })?;
 
@@ -266,6 +310,8 @@ pub async fn post_comment_like(
                 format!("failed to publish notification: {err}"),
             )
         })?;
+
+    trace!("notified user {} of new comment like", &comment.author);
 
     let comment_json_bytes = serde_json::to_vec(&comment).map_err(|err| {
         error!("failed to serialize comment: {err}");
