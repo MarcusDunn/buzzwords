@@ -3,7 +3,7 @@ services:
   nginx:
     image: nginx:latest
     volumes:
-      - ./templates:/etc/nginx/templates
+      - ./nginx:/etc/nginx/templates
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost" ]
       interval: 1s
@@ -51,8 +51,7 @@ services:
       timeout: 1s
       retries: 5
       start_period: 1s
-    build:
-      context: .
+    image: ghcr.io/marcusdunn/buzzwords:master
     depends_on:
       mongo:
         condition: service_healthy

@@ -1,1 +1,1 @@
-curl -v localhost:3000/user/marcus
+curl -v localhost/user/marcus
